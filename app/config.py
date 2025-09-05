@@ -5,8 +5,6 @@ import sys
 from enum import Enum
 from typing import Optional
 
-from fastapi import Request
-from fastapi.middleware.base import BaseHTTPMiddleware
 from pydantic_settings import BaseSettings
 
 
@@ -56,16 +54,15 @@ def get_env_variable(var_name: str, default_value: str = "") -> str:
     return os.getenv(var_name, default_value)
 
 
-class LogMiddleware(BaseHTTPMiddleware):
-    """Middleware for request/response logging."""
-
-    async def dispatch(self, request: Request, call_next):
-        # Log request
-        logger.info(f"{request.method} {request.url.path}")
+# LogMiddleware moved to main.py to avoid circular imports
+class SimpleLogMiddleware:
+    """Simple logging middleware without BaseHTTPMiddleware dependency."""
+    
+    def __init__(self, app):
+        self.app = app
+    
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            logger.info(f"{scope['method']} {scope['path']}")
         
-        response = await call_next(request)
-        
-        # Log response
-        logger.info(f"Response status: {response.status_code}")
-        
-        return response
+        return await self.app(scope, receive, send)
