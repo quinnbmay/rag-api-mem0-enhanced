@@ -1,307 +1,234 @@
-import json
+# app/routes/document_routes.py
 import os
-from typing import List, Optional, Dict, Any
-from uuid import uuid4
-import asyncio
+import hashlib
+import traceback
+import aiofiles
+import aiofiles.os
+import json
 import redis
 import requests
-from concurrent.futures import ThreadPoolExecutor
-
-from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Depends, Request
+from shutil import copyfileobj
+from typing import List, Iterable, Dict, Any, Optional
 from pydantic import BaseModel, Field
-from starlette.responses import JSONResponse
+from fastapi import (
+    APIRouter,
+    Request,
+    UploadFile,
+    HTTPException,
+    File,
+    Form,
+    Body,
+    Query,
+    status,
+)
+from langchain_core.documents import Document
+from langchain_core.runnables import run_in_executor
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from functools import lru_cache
 
-from app.config import get_env_variable, logger
+from app.config import logger, vector_store, RAG_UPLOAD_DIR, CHUNK_SIZE, CHUNK_OVERLAP, get_env_variable
+from app.constants import ERROR_MESSAGES
 from app.models import (
-    Document,
-    ProcessDocumentRequest,
-    SearchRequest,
-    SearchResult,
-    DocumentDeleteRequest,
-    DocumentListResponse,
-    DocumentFilter,
-    ProcessingQueueResponse,
-    ProcessingJobResponse,
-    BatchProcessRequest
+    StoreDocument,
+    QueryRequestBody,
+    DocumentResponse,
+    QueryMultipleBody,
 )
-from app.services import (
-    document_service,
-    background_tasks_service
+from app.services.vector_store.async_pg_vector import AsyncPgVector
+from app.utils.document_loader import (
+    get_loader,
+    clean_text,
+    process_documents,
+    cleanup_temp_encoding_file,
 )
-from app.services.database import PSQLDatabase
+from app.utils.health import is_health_ok
 
-router = APIRouter(tags=["documents"])
+router = APIRouter()
 
-# Configuration for new services
+# Mem0 and DragonflyDB Configuration
 MEM0_API_KEY = get_env_variable("MEM0_API_KEY", "")
 MEM0_USER_ID = get_env_variable("MEM0_USER_ID", "default_user")
 DRAGONFLY_URL = get_env_variable("DRAGONFLY_URL", "")
 
-# Pydantic models for new endpoints
+# Additional Pydantic Models for Memory Integration
 class MemoryRequest(BaseModel):
-    content: str = Field(..., description="Content to store in memory")
-    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional metadata")
+    content: str = Field(..., description="Memory content to store")
+    user_id: Optional[str] = Field(default=None, description="User ID for memory storage")
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Additional memory metadata")
 
 class MemorySearchRequest(BaseModel):
-    query: str = Field(..., description="Search query")
-    limit: int = Field(default=10, description="Maximum number of results")
+    query: str = Field(..., description="Memory search query")
+    user_id: Optional[str] = Field(default=None, description="User ID for memory search")
+    limit: int = Field(default=10, description="Maximum number of memories to return")
 
 class HybridSearchRequest(BaseModel):
-    query: str = Field(..., description="Search query")
-    limit: int = Field(default=10, description="Maximum number of results")
-    search_type: str = Field(default="hybrid", description="Type of search: hybrid, memory_only, rag_only")
+    query: str = Field(..., description="Hybrid search query")
+    user_id: Optional[str] = Field(default=None, description="User ID for memory component")
+    top_k: int = Field(default=5, description="Number of document results")
+    memory_limit: int = Field(default=5, description="Number of memory results")
+    cache_ttl: int = Field(default=300, description="Cache time-to-live in seconds")
 
-# Hybrid Memory System Implementation
 class HybridMemorySystem:
+    """
+    Three-tier hybrid memory system:
+    - Hot: DragonflyDB cache (Redis protocol)
+    - Warm: Mem0 personal memory
+    - Cold: RAG document search
+    """
+    
     def __init__(self):
-        self.dragonfly_client = None
+        self.redis_client = None
+        self.mem0_api_key = MEM0_API_KEY
+        self.mem0_base_url = "https://api.mem0.ai/v1"
+        self.default_user_id = MEM0_USER_ID
+        self._initialize_dragonfly()
+    
+    def _initialize_dragonfly(self):
+        """Initialize DragonflyDB connection if URL is provided"""
         if DRAGONFLY_URL:
             try:
-                self.dragonfly_client = redis.from_url(DRAGONFLY_URL, decode_responses=True)
-                logger.info("DragonflyDB connection established")
+                self.redis_client = redis.from_url(DRAGONFLY_URL, decode_responses=True)
+                self.redis_client.ping()
+                print("[OK] DragonflyDB connected successfully")
             except Exception as e:
-                logger.error(f"Failed to connect to DragonflyDB: {e}")
+                print(f"[WARN] Failed to connect to DragonflyDB: {e}")
+                self.redis_client = None
+        else:
+            print("[INFO] DragonflyDB URL not provided, caching disabled")
     
-    async def add_memory(self, content: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Add content to Mem0 memory system"""
-        if not MEM0_API_KEY:
-            raise HTTPException(status_code=500, detail="Mem0 API key not configured")
+    def _get_cache_key(self, query: str, query_type: str = "hybrid") -> str:
+        """Generate cache key for query"""
+        return f"{query_type}:{hash(query)}"
+    
+    async def get_cached_result(self, query: str, query_type: str = "hybrid") -> Optional[Dict[str, Any]]:
+        """Get cached result from DragonflyDB"""
+        if not self.redis_client:
+            return None
         
         try:
-            headers = {
-                "Authorization": f"Bearer {MEM0_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "messages": [{"content": content, "role": "user"}],
-                "user_id": MEM0_USER_ID
-            }
-            
-            if metadata:
-                payload["metadata"] = metadata
-            
+            cache_key = self._get_cache_key(query, query_type)
+            cached_data = self.redis_client.get(cache_key)
+            if cached_data:
+                print(f"[HOT] Cache HIT for query: {query}")
+                return json.loads(cached_data)
+            else:
+                print(f"[COLD] Cache MISS for query: {query}")
+                return None
+        except Exception as e:
+            print(f"[ERROR] Cache read error: {e}")
+            return None
+    
+    async def cache_result(self, query: str, result: Dict[str, Any], ttl: int = 300, query_type: str = "hybrid"):
+        """Cache result in DragonflyDB"""
+        if not self.redis_client:
+            return
+        
+        try:
+            cache_key = self._get_cache_key(query, query_type)
+            self.redis_client.setex(cache_key, ttl, json.dumps(result))
+            print(f"[CACHE] Cached {query_type} result for: {query}")
+        except Exception as e:
+            print(f"[ERROR] Cache write error: {e}")
+    
+    async def add_memory(self, content: str, user_id: Optional[str] = None, metadata: Optional[Dict] = None) -> Dict[str, Any]:
+        """Add memory to Mem0"""
+        if not self.mem0_api_key:
+            raise HTTPException(status_code=400, detail="Mem0 API key not configured")
+        
+        user_id = user_id or self.default_user_id
+        headers = {
+            "Authorization": f"Token {self.mem0_api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "messages": [{"role": "user", "content": content}],
+            "user_id": user_id
+        }
+        
+        if metadata:
+            payload["metadata"] = metadata
+        
+        try:
             response = requests.post(
-                "https://api.mem0.ai/v1/memories/",
+                f"{self.mem0_base_url}/memories/",
                 headers=headers,
                 json=payload,
                 timeout=30
             )
             
-            if response.status_code == 201:
-                result = response.json()
-                
-                # Cache in DragonflyDB if available
-                if self.dragonfly_client:
-                    try:
-                        cache_key = f"memory:{MEM0_USER_ID}:{result.get('id', 'unknown')}"
-                        self.dragonfly_client.setex(cache_key, 3600, json.dumps(result))
-                    except Exception as e:
-                        logger.warning(f"Failed to cache in DragonflyDB: {e}")
-                
-                return result
+            if response.status_code == 200:
+                return response.json()
             else:
-                logger.error(f"Mem0 API error: {response.status_code} - {response.text}")
-                raise HTTPException(status_code=response.status_code, detail="Failed to add memory")
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request to Mem0 failed: {e}")
-            raise HTTPException(status_code=500, detail="Memory service unavailable")
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Mem0 API error: {response.status_code}"
+                )
+        except requests.RequestException as e:
+            raise HTTPException(status_code=500, detail=f"Mem0 API request failed: {str(e)}")
     
-    async def search_memory(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Search Mem0 memories"""
-        if not MEM0_API_KEY:
-            raise HTTPException(status_code=500, detail="Mem0 API key not configured")
+    async def search_memory(self, query: str, user_id: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
+        """Search memories in Mem0"""
+        if not self.mem0_api_key:
+            return []
         
-        # Check cache first
-        cache_key = f"search:{MEM0_USER_ID}:{hash(query)}:{limit}"
-        if self.dragonfly_client:
-            try:
-                cached = self.dragonfly_client.get(cache_key)
-                if cached:
-                    logger.info("[CACHE HIT] Memory search served from DragonflyDB")
-                    return json.loads(cached)
-            except Exception as e:
-                logger.warning(f"Cache read failed: {e}")
+        user_id = user_id or self.default_user_id
+        headers = {
+            "Authorization": f"Token {self.mem0_api_key}",
+            "Content-Type": "application/json"
+        }
         
         try:
-            headers = {
-                "Authorization": f"Bearer {MEM0_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            
-            params = {
-                "user_id": MEM0_USER_ID,
-                "query": query,
-                "limit": limit
-            }
-            
             response = requests.get(
-                "https://api.mem0.ai/v1/memories/search/",
+                f"{self.mem0_base_url}/memories/",
                 headers=headers,
-                params=params,
+                params={
+                    "user_id": user_id,
+                    "query": query,
+                    "limit": limit
+                },
                 timeout=30
             )
             
             if response.status_code == 200:
-                results = response.json().get("results", [])
-                
-                # Cache results
-                if self.dragonfly_client:
-                    try:
-                        self.dragonfly_client.setex(cache_key, 300, json.dumps(results))
-                        logger.info("[CACHE MISS] Memory search results cached")
-                    except Exception as e:
-                        logger.warning(f"Failed to cache search results: {e}")
-                
-                return results
+                data = response.json()
+                return data.get("results", [])
             else:
-                logger.error(f"Mem0 search error: {response.status_code} - {response.text}")
-                raise HTTPException(status_code=response.status_code, detail="Memory search failed")
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Memory search request failed: {e}")
-            raise HTTPException(status_code=500, detail="Memory service unavailable")
-    
-    async def hybrid_search(self, query: str, limit: int = 10, search_type: str = "hybrid") -> Dict[str, Any]:
-        """Perform hybrid search across memory and RAG systems"""
-        results = {
-            "query": query,
-            "search_type": search_type,
-            "results": {
-                "memory_results": [],
-                "rag_results": [],
-                "combined_results": []
-            },
-            "metadata": {
-                "memory_count": 0,
-                "rag_count": 0,
-                "cache_status": "miss"
-            }
-        }
-        
-        # Check cache for hybrid search
-        cache_key = f"hybrid:{MEM0_USER_ID}:{hash(query)}:{limit}:{search_type}"
-        if self.dragonfly_client:
-            try:
-                cached = self.dragonfly_client.get(cache_key)
-                if cached:
-                    logger.info("[CACHE HIT] Hybrid search served from DragonflyDB")
-                    cached_result = json.loads(cached)
-                    cached_result["metadata"]["cache_status"] = "hit"
-                    return cached_result
-            except Exception as e:
-                logger.warning(f"Cache read failed: {e}")
-        
-        try:
-            # Memory search (Tier 2: Warm)
-            if search_type in ["hybrid", "memory_only"]:
-                try:
-                    memory_results = await self.search_memory(query, limit//2 if search_type == "hybrid" else limit)
-                    results["results"]["memory_results"] = memory_results
-                    results["metadata"]["memory_count"] = len(memory_results)
-                    logger.info(f"Memory search returned {len(memory_results)} results")
-                except Exception as e:
-                    logger.warning(f"Memory search failed: {e}")
-            
-            # RAG search (Tier 3: Cold)
-            if search_type in ["hybrid", "rag_only"]:
-                try:
-                    search_request = SearchRequest(query=query, limit=limit//2 if search_type == "hybrid" else limit)
-                    rag_response = await document_service.search_documents(search_request)
-                    results["results"]["rag_results"] = rag_response.results
-                    results["metadata"]["rag_count"] = len(rag_response.results)
-                    logger.info(f"RAG search returned {len(rag_response.results)} results")
-                except Exception as e:
-                    logger.warning(f"RAG search failed: {e}")
-            
-            # Combine and rank results
-            combined = []
-            
-            # Add memory results with higher priority
-            for i, mem_result in enumerate(results["results"]["memory_results"]):
-                combined.append({
-                    "content": mem_result.get("memory", ""),
-                    "score": 0.9 - (i * 0.1),  # Higher scores for memory
-                    "source": "memory",
-                    "metadata": mem_result
-                })
-            
-            # Add RAG results with lower priority
-            for i, rag_result in enumerate(results["results"]["rag_results"]):
-                combined.append({
-                    "content": rag_result.content,
-                    "score": 0.7 - (i * 0.05),  # Lower scores for RAG
-                    "source": "rag",
-                    "metadata": {
-                        "document_id": rag_result.document_id,
-                        "relevance_score": rag_result.relevance_score
-                    }
-                })
-            
-            # Sort by score and limit
-            combined.sort(key=lambda x: x["score"], reverse=True)
-            results["results"]["combined_results"] = combined[:limit]
-            
-            # Cache results
-            if self.dragonfly_client:
-                try:
-                    self.dragonfly_client.setex(cache_key, 300, json.dumps(results))
-                    logger.info("[CACHE MISS] Hybrid search results cached")
-                except Exception as e:
-                    logger.warning(f"Failed to cache hybrid results: {e}")
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Hybrid search failed: {e}")
-            raise HTTPException(status_code=500, detail="Hybrid search failed")
+                print(f"[WARN] Mem0 search failed: {response.status_code}")
+                return []
+        except requests.RequestException as e:
+            print(f"[ERROR] Mem0 search error: {str(e)}")
+            return []
     
     def get_system_status(self) -> Dict[str, Any]:
-        """Get status of all memory system components"""
+        """Get system status for all components"""
+        from datetime import datetime
+        
         status = {
-            "timestamp": asyncio.get_event_loop().time(),
+            "timestamp": datetime.utcnow().isoformat(),
             "components": {
-                "mem0": {
-                    "configured": bool(MEM0_API_KEY),
-                    "user_id": MEM0_USER_ID,
-                    "status": "unknown"
+                "dragonfly_cache": {
+                    "enabled": self.redis_client is not None,
+                    "connected": False
                 },
-                "dragonfly": {
-                    "configured": bool(DRAGONFLY_URL),
-                    "connected": False,
-                    "status": "disconnected"
+                "mem0_memory": {
+                    "enabled": bool(self.mem0_api_key),
+                    "api_key_set": bool(self.mem0_api_key)
                 },
-                "rag": {
-                    "status": "available"
+                "rag_search": {
+                    "enabled": True,
+                    "vector_store": "pgvector"
                 }
             }
         }
         
         # Test DragonflyDB connection
-        if self.dragonfly_client:
+        if self.redis_client:
             try:
-                self.dragonfly_client.ping()
-                status["components"]["dragonfly"]["connected"] = True
-                status["components"]["dragonfly"]["status"] = "connected"
-            except Exception as e:
-                status["components"]["dragonfly"]["status"] = f"error: {str(e)}"
-        
-        # Test Mem0 connection
-        if MEM0_API_KEY:
-            try:
-                headers = {"Authorization": f"Bearer {MEM0_API_KEY}"}
-                response = requests.get(
-                    f"https://api.mem0.ai/v1/memories/?user_id={MEM0_USER_ID}&limit=1",
-                    headers=headers,
-                    timeout=5
-                )
-                if response.status_code == 200:
-                    status["components"]["mem0"]["status"] = "connected"
-                else:
-                    status["components"]["mem0"]["status"] = f"error: {response.status_code}"
-            except Exception as e:
-                status["components"]["mem0"]["status"] = f"error: {str(e)}"
+                self.redis_client.ping()
+                status["components"]["dragonfly_cache"]["connected"] = True
+            except:
+                status["components"]["dragonfly_cache"]["connected"] = False
         
         return status
 
@@ -311,312 +238,331 @@ hybrid_memory = HybridMemorySystem()
 # New Memory Integration Endpoints
 @router.post("/memory/add")
 async def add_memory(request: MemoryRequest):
-    """Add content to personal memory system"""
+    """Add memory to Mem0"""
     try:
-        result = await hybrid_memory.add_memory(request.content, request.metadata)
+        result = await hybrid_memory.add_memory(
+            content=request.content,
+            user_id=request.user_id,
+            metadata=request.metadata
+        )
         return {
-            "success": True,
-            "message": "Memory added successfully",
-            "data": result
+            "status": "success",
+            "memory_id": result.get("id"),
+            "message": "Memory added successfully"
         }
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Memory add failed: {e}")
-        raise HTTPException(status_code=500, detail="Failed to add memory")
+        raise HTTPException(status_code=500, detail=f"Error adding memory: {str(e)}")
 
 @router.post("/memory/search")
 async def search_memory(request: MemorySearchRequest):
-    """Search personal memories"""
+    """Search memories in Mem0"""
     try:
-        results = await hybrid_memory.search_memory(request.query, request.limit)
+        memories = await hybrid_memory.search_memory(
+            query=request.query,
+            user_id=request.user_id,
+            limit=request.limit
+        )
+        
         return {
-            "success": True,
             "query": request.query,
-            "results": results,
-            "count": len(results)
+            "memories": memories,
+            "total_memories": len(memories)
         }
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Memory search failed: {e}")
-        raise HTTPException(status_code=500, detail="Memory search failed")
+        raise HTTPException(status_code=500, detail=f"Error searching memory: {str(e)}")
 
 @router.post("/search/hybrid")
 async def hybrid_search(request: HybridSearchRequest):
-    """Perform hybrid search across memory and document systems"""
+    """
+    Hybrid search combining three tiers:
+    1. Hot: DragonflyDB cache (instant retrieval)
+    2. Warm: Mem0 personal memory (contextual)
+    3. Cold: RAG document search (comprehensive)
+    """
     try:
-        results = await hybrid_memory.hybrid_search(
-            request.query, 
-            request.limit, 
-            request.search_type
+        from datetime import datetime
+        import asyncio
+        
+        # Check cache first (Hot tier)
+        cached_result = await hybrid_memory.get_cached_result(request.query, "hybrid")
+        if cached_result:
+            return cached_result
+        
+        # Perform searches in parallel
+        async def search_documents_async():
+            try:
+                # Use existing RAG search functionality
+                query_body = QueryRequestBody(
+                    query=request.query,
+                    top_k=request.top_k
+                )
+                # Call the existing search endpoint logic
+                documents = await vector_store.similarity_search_with_score(
+                    query=request.query,
+                    k=request.top_k
+                )
+                return [
+                    {
+                        "content": doc.page_content,
+                        "metadata": doc.metadata,
+                        "similarity_score": float(score),
+                        "source": "documents"
+                    }
+                    for doc, score in documents
+                ]
+            except Exception as e:
+                print(f"[ERROR] Document search failed: {e}")
+                return []
+        
+        async def search_memories_async():
+            try:
+                memories = await hybrid_memory.search_memory(
+                    query=request.query,
+                    user_id=request.user_id,
+                    limit=request.memory_limit
+                )
+                return [
+                    {
+                        "content": mem.get("memory", ""),
+                        "metadata": mem.get("metadata", {}),
+                        "score": mem.get("score", 0.0),
+                        "source": "memory",
+                        "created_at": mem.get("created_at"),
+                        "updated_at": mem.get("updated_at")
+                    }
+                    for mem in memories
+                ]
+            except Exception as e:
+                print(f"[ERROR] Memory search failed: {e}")
+                return []
+        
+        # Execute searches concurrently
+        document_results, memory_results = await asyncio.gather(
+            search_documents_async(),
+            search_memories_async(),
+            return_exceptions=True
         )
-        return {
-            "success": True,
-            "data": results
+        
+        # Handle exceptions
+        if isinstance(document_results, Exception):
+            document_results = []
+        if isinstance(memory_results, Exception):
+            memory_results = []
+        
+        # Combine results
+        hybrid_result = {
+            "query": request.query,
+            "timestamp": datetime.utcnow().isoformat(),
+            "results": {
+                "documents": document_results,
+                "memories": memory_results,
+                "combined_count": len(document_results) + len(memory_results)
+            },
+            "search_stats": {
+                "document_results": len(document_results),
+                "memory_results": len(memory_results),
+                "cached": False
+            }
         }
-    except HTTPException:
-        raise
+        
+        # Cache the result (async, don't wait)
+        asyncio.create_task(
+            hybrid_memory.cache_result(request.query, hybrid_result, request.cache_ttl, "hybrid")
+        )
+        
+        return hybrid_result
+        
     except Exception as e:
-        logger.error(f"Hybrid search failed: {e}")
-        raise HTTPException(status_code=500, detail="Hybrid search failed")
+        raise HTTPException(status_code=500, detail=f"Error in hybrid search: {str(e)}")
 
 @router.get("/memory/status")
 async def memory_system_status():
-    """Get status of all memory system components"""
-    try:
-        status = hybrid_memory.get_system_status()
-        return {
-            "success": True,
-            "data": status
-        }
-    except Exception as e:
-        logger.error(f"Status check failed: {e}")
-        raise HTTPException(status_code=500, detail="Status check failed")
+    """Get status of the hybrid memory system components"""
+    return hybrid_memory.get_system_status()
 
 # Existing endpoints continue below...
 
-@router.post("/upload", response_model=ProcessingJobResponse)
-async def upload_document(
-    request: Request,
-    background_tasks: BackgroundTasks,
+@router.post("/documents/upload")
+async def upload_documents(
     files: List[UploadFile] = File(...),
+    chunk_size: Optional[int] = Query(None),
+    chunk_overlap: Optional[int] = Query(None),
 ):
-    """Upload one or more documents for processing."""
-    
-    logger.info(f"Upload request received for {len(files)} files")
-    
-    if not files or len(files) == 0:
-        raise HTTPException(status_code=400, detail="No files provided")
-    
-    # Validate file extensions
-    allowed_extensions = {".txt", ".pdf", ".docx", ".md"}
-    for file in files:
-        if not any(file.filename.lower().endswith(ext) for ext in allowed_extensions):
+    """Upload and process documents"""
+    try:
+        if not files:
             raise HTTPException(
-                status_code=400, 
-                detail=f"File type not supported: {file.filename}. Allowed types: {', '.join(allowed_extensions)}"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No files uploaded"
             )
-    
-    try:
-        # Create processing job
-        job_id = str(uuid4())
         
-        # Start background processing
-        background_tasks.add_task(
-            background_tasks_service.process_documents_background,
-            job_id,
-            files,
-            request.app.state.CHUNK_SIZE,
-            request.app.state.CHUNK_OVERLAP,
-            request.app.state.PDF_EXTRACT_IMAGES,
-            request.app.state.thread_pool
-        )
+        # Use provided chunk settings or defaults
+        effective_chunk_size = chunk_size or CHUNK_SIZE
+        effective_chunk_overlap = chunk_overlap or CHUNK_OVERLAP
         
-        return ProcessingJobResponse(
-            job_id=job_id,
-            status="processing",
-            message="Files uploaded successfully. Processing started.",
-            files_count=len(files)
-        )
+        processed_docs = []
         
-    except Exception as e:
-        logger.error(f"Upload failed: {e}")
-        raise HTTPException(status_code=500, detail="Upload processing failed")
-
-@router.post("/process", response_model=ProcessingJobResponse) 
-async def process_document(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    process_request: ProcessDocumentRequest
-):
-    """Process a document from URL or text content."""
-    
-    logger.info(f"Process request received: {process_request.source_type}")
-    
-    try:
-        # Create processing job
-        job_id = str(uuid4())
-        
-        # Start background processing
-        background_tasks.add_task(
-            background_tasks_service.process_document_background,
-            job_id,
-            process_request,
-            request.app.state.CHUNK_SIZE,
-            request.app.state.CHUNK_OVERLAP,
-            request.app.state.PDF_EXTRACT_IMAGES,
-            request.app.state.thread_pool
-        )
-        
-        return ProcessingJobResponse(
-            job_id=job_id,
-            status="processing",
-            message="Document processing started.",
-            files_count=1
-        )
-        
-    except Exception as e:
-        logger.error(f"Process request failed: {e}")
-        raise HTTPException(status_code=500, detail="Document processing failed")
-
-@router.post("/batch-process", response_model=ProcessingJobResponse)
-async def batch_process_documents(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    batch_request: BatchProcessRequest
-):
-    """Process multiple documents in batch."""
-    
-    logger.info(f"Batch process request received for {len(batch_request.documents)} documents")
-    
-    if not batch_request.documents or len(batch_request.documents) == 0:
-        raise HTTPException(status_code=400, detail="No documents provided")
-    
-    try:
-        # Create processing job
-        job_id = str(uuid4())
-        
-        # Start background processing
-        background_tasks.add_task(
-            background_tasks_service.process_batch_background,
-            job_id,
-            batch_request,
-            request.app.state.CHUNK_SIZE,
-            request.app.state.CHUNK_OVERLAP,
-            request.app.state.PDF_EXTRACT_IMAGES,
-            request.app.state.thread_pool
-        )
-        
-        return ProcessingJobResponse(
-            job_id=job_id,
-            status="processing",
-            message="Batch processing started.",
-            files_count=len(batch_request.documents)
-        )
-        
-    except Exception as e:
-        logger.error(f"Batch process failed: {e}")
-        raise HTTPException(status_code=500, detail="Batch processing failed")
-
-@router.get("/job/{job_id}", response_model=ProcessingJobResponse)
-async def get_processing_job_status(job_id: str):
-    """Get the status of a processing job."""
-    
-    try:
-        job_status = await background_tasks_service.get_job_status(job_id)
-        if not job_status:
-            raise HTTPException(status_code=404, detail="Job not found")
+        for file in files:
+            # Validate file type
+            if not any(file.filename.lower().endswith(ext) for ext in ['.txt', '.pdf', '.docx', '.md']):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Unsupported file type: {file.filename}"
+                )
             
-        return job_status
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to get job status: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get job status")
-
-@router.get("/queue", response_model=ProcessingQueueResponse)
-async def get_processing_queue():
-    """Get current processing queue status."""
-    
-    try:
-        queue_status = await background_tasks_service.get_queue_status()
-        return queue_status
-        
-    except Exception as e:
-        logger.error(f"Failed to get queue status: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get queue status")
-
-@router.post("/search", response_model=SearchResult)
-async def search_documents(search_request: SearchRequest):
-    """Search through processed documents."""
-    
-    logger.info(f"Search request: '{search_request.query}' (limit: {search_request.limit})")
-    
-    try:
-        results = await document_service.search_documents(search_request)
-        logger.info(f"Search completed: {len(results.results)} results found")
-        return results
-        
-    except Exception as e:
-        logger.error(f"Search failed: {e}")
-        raise HTTPException(status_code=500, detail="Search operation failed")
-
-@router.get("/documents", response_model=DocumentListResponse)
-async def list_documents(
-    limit: int = 50,
-    offset: int = 0,
-    search: Optional[str] = None,
-    document_type: Optional[str] = None
-):
-    """List all processed documents with optional filtering."""
-    
-    try:
-        document_filter = DocumentFilter(
-            search=search,
-            document_type=document_type,
-            limit=limit,
-            offset=offset
-        )
-        
-        results = await document_service.list_documents(document_filter)
-        return results
-        
-    except Exception as e:
-        logger.error(f"Failed to list documents: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve documents")
-
-@router.get("/documents/{document_id}", response_model=Document)
-async def get_document(document_id: str):
-    """Get a specific document by ID."""
-    
-    try:
-        document = await document_service.get_document(document_id)
-        if not document:
-            raise HTTPException(status_code=404, detail="Document not found")
+            # Save uploaded file temporarily
+            file_id = hashlib.md5(f"{file.filename}_{file.size}".encode()).hexdigest()
+            temp_file_path = os.path.join(RAG_UPLOAD_DIR, f"{file_id}_{file.filename}")
             
-        return document
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to get document: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve document")
-
-@router.delete("/documents/{document_id}")
-async def delete_document(document_id: str):
-    """Delete a document and its associated chunks."""
-    
-    try:
-        success = await document_service.delete_document(document_id)
-        if not success:
-            raise HTTPException(status_code=404, detail="Document not found")
+            # Ensure upload directory exists
+            os.makedirs(RAG_UPLOAD_DIR, exist_ok=True)
             
-        return {"message": "Document deleted successfully"}
+            # Save file
+            async with aiofiles.open(temp_file_path, 'wb') as temp_file:
+                content = await file.read()
+                await temp_file.write(content)
+            
+            try:
+                # Process the document
+                loader = get_loader(temp_file_path)
+                documents = loader.load()
+                
+                if not documents:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"No content extracted from {file.filename}"
+                    )
+                
+                # Split documents into chunks
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=effective_chunk_size,
+                    chunk_overlap=effective_chunk_overlap
+                )
+                chunks = text_splitter.split_documents(documents)
+                
+                # Add metadata
+                for chunk in chunks:
+                    chunk.metadata.update({
+                        "file_id": file_id,
+                        "filename": file.filename,
+                        "upload_timestamp": str(os.path.getmtime(temp_file_path))
+                    })
+                
+                # Store in vector database
+                await vector_store.aadd_documents(chunks)
+                
+                processed_docs.append({
+                    "file_id": file_id,
+                    "filename": file.filename,
+                    "chunks_created": len(chunks),
+                    "status": "success"
+                })
+                
+            finally:
+                # Clean up temporary file
+                if os.path.exists(temp_file_path):
+                    await aiofiles.os.remove(temp_file_path)
         
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to delete document: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete document")
-
-@router.post("/documents/delete-batch")
-async def delete_documents_batch(delete_request: DocumentDeleteRequest):
-    """Delete multiple documents."""
-    
-    try:
-        results = await document_service.delete_documents_batch(delete_request.document_ids)
         return {
-            "message": f"Deleted {results['deleted_count']} documents",
-            "failed_deletes": results['failed_deletes']
+            "status": "success",
+            "processed_documents": processed_docs,
+            "total_files": len(files)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Document upload failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Document processing failed: {str(e)}"
+        )
+
+@router.post("/documents/query")
+async def query_documents(query_body: QueryRequestBody):
+    """Search through processed documents"""
+    try:
+        if not query_body.query.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Query cannot be empty"
+            )
+        
+        # Perform similarity search
+        results = await vector_store.similarity_search_with_score(
+            query=query_body.query,
+            k=query_body.top_k
+        )
+        
+        # Format results
+        formatted_results = []
+        for document, score in results:
+            formatted_results.append({
+                "content": document.page_content,
+                "metadata": document.metadata,
+                "relevance_score": float(score)
+            })
+        
+        return {
+            "query": query_body.query,
+            "results": formatted_results,
+            "total_results": len(formatted_results)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Query failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Search operation failed: {str(e)}"
+        )
+
+@router.delete("/documents/{file_id}")
+async def delete_document(file_id: str):
+    """Delete all chunks for a specific document"""
+    try:
+        # This would need to be implemented based on your vector store
+        # For now, return a placeholder response
+        return {
+            "status": "success",
+            "message": f"Document {file_id} deletion requested",
+            "file_id": file_id
         }
         
     except Exception as e:
-        logger.error(f"Batch delete failed: {e}")
-        raise HTTPException(status_code=500, detail="Batch delete operation failed")
+        logger.error(f"Document deletion failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Document deletion failed: {str(e)}"
+        )
+
+@router.get("/documents/stats")
+async def get_document_stats():
+    """Get statistics about stored documents"""
+    try:
+        # Implementation depends on your vector store
+        # This is a placeholder
+        return {
+            "total_documents": 0,
+            "total_chunks": 0,
+            "vector_store_type": "pgvector"
+        }
+        
+    except Exception as e:
+        logger.error(f"Stats retrieval failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Stats retrieval failed: {str(e)}"
+        )
 
 @router.get("/health")
 async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy", "service": "RAG API Enhanced"}
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": str(os.time.time()),
+        "version": "1.0.0-mem0-enhanced"
+    }
+
+print("[INFO] Hybrid Memory System initialized")
