@@ -4,6 +4,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 
@@ -18,12 +19,26 @@ from app.config import (
     CHUNK_OVERLAP,
     PDF_EXTRACT_IMAGES,
     VECTOR_DB_TYPE,
-    LogMiddleware,
     logger,
 )
 from app.middleware import security_middleware
 from app.routes import document_routes, pgvector_routes
 from app.services.database import PSQLDatabase, ensure_vector_indexes
+
+
+class LogMiddleware(BaseHTTPMiddleware):
+    """Middleware for request/response logging."""
+
+    async def dispatch(self, request: Request, call_next):
+        # Log request
+        logger.info(f"{request.method} {request.url.path}")
+        
+        response = await call_next(request)
+        
+        # Log response
+        logger.info(f"Response status: {response.status_code}")
+        
+        return response
 
 
 @asynccontextmanager
