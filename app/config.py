@@ -1,184 +1,292 @@
+# app/config.py
 import os
+import json
+import boto3
 import logging
-from dotenv import load_dotenv
-from typing import List, Optional, Dict
+import urllib.parse
 from enum import Enum
+from datetime import datetime
+from dotenv import find_dotenv, load_dotenv
+from starlette.middleware.base import BaseHTTPMiddleware
 
-# Load environment variables
-load_dotenv()
+from app.services.vector_store.factory import get_vector_store
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("app.log", encoding="utf-8")
-    ]
-)
-logger = logging.getLogger(__name__)
+load_dotenv(find_dotenv())
+
 
 class VectorDBType(Enum):
     PGVECTOR = "pgvector"
     ATLAS_MONGO = "atlas-mongo"
 
-def get_env_variable(name: str, default: Optional[str] = None, required: bool = True) -> Optional[str]:
-    """Get environment variable with proper error handling."""
-    value = os.getenv(name, default)
-    if required and value is None:
-        raise ValueError(f"Required environment variable {name} is not set")
+
+class EmbeddingsProvider(Enum):
+    OPENAI = "openai"
+    AZURE = "azure"
+    HUGGINGFACE = "huggingface"
+    HUGGINGFACETEI = "huggingfacetei"
+    OLLAMA = "ollama"
+    BEDROCK = "bedrock"
+    GOOGLE_VERTEXAI = "vertexai"
+
+
+def get_env_variable(
+    var_name: str, default_value: str = None, required: bool = False
+) -> str:
+    value = os.getenv(var_name)
+    if value is None:
+        if default_value is None and required:
+            raise ValueError(f"Environment variable '{var_name}' not found.")
+        return default_value
     return value
 
-# Core Configuration
-OPENAI_API_KEY = get_env_variable("OPENAI_API_KEY")
-PORT = int(get_env_variable("PORT", "8000", required=False))
-HOST = get_env_variable("HOST", "0.0.0.0", required=False)
 
-# Document processing configuration
-RAG_UPLOAD_DIR = get_env_variable("RAG_UPLOAD_DIR", "uploads", required=False)
-CHUNK_SIZE = int(get_env_variable("CHUNK_SIZE", "1000", required=False))
-CHUNK_OVERLAP = int(get_env_variable("CHUNK_OVERLAP", "200", required=False))
-MAX_UPLOAD_SIZE_MB = int(get_env_variable("MAX_UPLOAD_SIZE_MB", "50", required=False))
+RAG_HOST = os.getenv("RAG_HOST", "0.0.0.0")
+RAG_PORT = int(os.getenv("RAG_PORT", 8000))
 
-# Embeddings Configuration
-EMBEDDINGS_PROVIDER = get_env_variable("EMBEDDINGS_PROVIDER", "openai", required=False)
-EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "text-embedding-ada-002", required=False)
+RAG_UPLOAD_DIR = get_env_variable("RAG_UPLOAD_DIR", "./uploads/")
+if not os.path.exists(RAG_UPLOAD_DIR):
+    os.makedirs(RAG_UPLOAD_DIR, exist_ok=True)
 
-# Vector Database Configuration
-vector_db_type_str = get_env_variable("VECTOR_DB_TYPE", "pgvector", required=False)
-VECTOR_DB_TYPE = VectorDBType(vector_db_type_str.lower())
+VECTOR_DB_TYPE = VectorDBType(
+    get_env_variable("VECTOR_DB_TYPE", VectorDBType.PGVECTOR.value)
+)
+POSTGRES_USE_UNIX_SOCKET = (
+    get_env_variable("POSTGRES_USE_UNIX_SOCKET", "False").lower() == "true"
+)
+POSTGRES_DB = get_env_variable("POSTGRES_DB", "mydatabase")
+POSTGRES_USER = get_env_variable("POSTGRES_USER", "myuser")
+POSTGRES_PASSWORD = get_env_variable("POSTGRES_PASSWORD", "mypassword")
+DB_HOST = get_env_variable("DB_HOST", "db")
+DB_PORT = get_env_variable("DB_PORT", "5432")
+COLLECTION_NAME = get_env_variable("COLLECTION_NAME", "testcollection")
+ATLAS_MONGO_DB_URI = get_env_variable(
+    "ATLAS_MONGO_DB_URI", "mongodb://127.0.0.1:27018/LibreChat"
+)
+ATLAS_SEARCH_INDEX = get_env_variable("ATLAS_SEARCH_INDEX", "vector_index")
+MONGO_VECTOR_COLLECTION = get_env_variable(
+    "MONGO_VECTOR_COLLECTION", None
+)  # Deprecated, backwards compatability
+CHUNK_SIZE = int(get_env_variable("CHUNK_SIZE", "1500"))
+CHUNK_OVERLAP = int(get_env_variable("CHUNK_OVERLAP", "100"))
 
-# Database Configuration
-DATABASE_URL = get_env_variable("DATABASE_URL", required=False)
-PGUSER = get_env_variable("PGUSER", required=False)
-PGPASSWORD = get_env_variable("PGPASSWORD", required=False)
-PGHOST = get_env_variable("PGHOST", required=False)
-PGPORT = int(get_env_variable("PGPORT", "5432", required=False))
-PGDATABASE = get_env_variable("PGDATABASE", required=False)
+env_value = get_env_variable("PDF_EXTRACT_IMAGES", "False").lower()
+PDF_EXTRACT_IMAGES = True if env_value == "true" else False
 
-# Connection string prioritization
-if DATABASE_URL:
-    CONNECTION_STRING = DATABASE_URL
-elif all([PGUSER, PGPASSWORD, PGHOST, PGDATABASE]):
-    CONNECTION_STRING = f"postgresql://{PGUSER}:{PGPASSWORD}@{PGHOST}:{PGPORT}/{PGDATABASE}"
+if POSTGRES_USE_UNIX_SOCKET:
+    connection_suffix = f"{urllib.parse.quote_plus(POSTGRES_USER)}:{urllib.parse.quote_plus(POSTGRES_PASSWORD)}@/{urllib.parse.quote_plus(POSTGRES_DB)}?host={urllib.parse.quote_plus(DB_HOST)}"
 else:
-    CONNECTION_STRING = None
-    logger.warning("No database connection string available")
+    connection_suffix = f"{urllib.parse.quote_plus(POSTGRES_USER)}:{urllib.parse.quote_plus(POSTGRES_PASSWORD)}@{DB_HOST}:{DB_PORT}/{urllib.parse.quote_plus(POSTGRES_DB)}"
 
-# MongoDB Atlas Configuration (for atlas-mongo vector store)
-ATLAS_MONGO_DB_URI = get_env_variable("ATLAS_MONGO_DB_URI", required=False)
-ATLAS_SEARCH_INDEX = get_env_variable("ATLAS_SEARCH_INDEX", required=False)
-MONGO_VECTOR_COLLECTION = get_env_variable("MONGO_VECTOR_COLLECTION", required=False)
+CONNECTION_STRING = f"postgresql+psycopg2://{connection_suffix}"
+DSN = f"postgresql://{connection_suffix}"
 
-# Collection Configuration
-COLLECTION_NAME = get_env_variable("COLLECTION_NAME", "vector_index", required=False)
+## Logging
 
-# JWT Configuration
-JWT_SECRET_KEY = get_env_variable("JWT_SECRET_KEY", "your-secret-key-change-this-in-production", required=False)
-JWT_ALGORITHM = get_env_variable("JWT_ALGORITHM", "HS256", required=False)
-JWT_EXPIRATION_HOURS = int(get_env_variable("JWT_EXPIRATION_HOURS", "24", required=False))
+HTTP_RES = "http_res"
+HTTP_REQ = "http_req"
 
-# CORS Configuration
-CORS_ORIGINS = get_env_variable("CORS_ORIGINS", "*", required=False).split(",")
+logger = logging.getLogger()
 
-# Rate Limiting Configuration
-RATE_LIMIT_REQUESTS = int(get_env_variable("RATE_LIMIT_REQUESTS", "100", required=False))
-RATE_LIMIT_PERIOD = int(get_env_variable("RATE_LIMIT_PERIOD", "60", required=False))
+debug_mode = os.getenv("DEBUG_RAG_API", "False").lower() in (
+    "true",
+    "1",
+    "yes",
+    "y",
+    "t",
+)
+console_json = get_env_variable("CONSOLE_JSON", "False").lower() == "true"
 
-# Mem0 Integration Configuration
-MEM0_API_KEY = get_env_variable("MEM0_API_KEY", required=False)
-MEM0_BASE_URL = get_env_variable("MEM0_BASE_URL", "https://api.mem0.ai", required=False)
+if debug_mode:
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.setLevel(logging.INFO)
 
-# DragonflyDB Configuration
-DRAGONFLY_URL = get_env_variable("DRAGONFLY_URL", required=False)
-DRAGONFLY_HOST = get_env_variable("DRAGONFLY_HOST", "localhost", required=False)
-DRAGONFLY_PORT = int(get_env_variable("DRAGONFLY_PORT", "6379", required=False))
-DRAGONFLY_PASSWORD = get_env_variable("DRAGONFLY_PASSWORD", required=False)
-CACHE_TTL = int(get_env_variable("CACHE_TTL", "3600", required=False))  # 1 hour default
+if console_json:
 
-# Build connection string for DragonflyDB if not provided
-if not DRAGONFLY_URL and DRAGONFLY_HOST and DRAGONFLY_PORT:
-    if DRAGONFLY_PASSWORD:
-        DRAGONFLY_URL = f"redis://:{DRAGONFLY_PASSWORD}@{DRAGONFLY_HOST}:{DRAGONFLY_PORT}"
-    else:
-        DRAGONFLY_URL = f"redis://{DRAGONFLY_HOST}:{DRAGONFLY_PORT}"
+    class JsonFormatter(logging.Formatter):
+        def __init__(self):
+            super(JsonFormatter, self).__init__()
 
-# Default user for hybrid memory system
-DEFAULT_HYBRID_USER = get_env_variable("DEFAULT_HYBRID_USER", "quinn_may", required=False)
+        def format(self, record):
+            json_record = {}
 
-# Create uploads directory if it doesn't exist
-os.makedirs(RAG_UPLOAD_DIR, exist_ok=True)
+            json_record["message"] = record.getMessage()
 
-logger.info("Configuration loaded successfully")
-logger.info(f"Vector DB Type: {VECTOR_DB_TYPE}")
-logger.info(f"Embeddings Provider: {EMBEDDINGS_PROVIDER}")
-logger.info(f"Collection Name: {COLLECTION_NAME}")
-logger.info(f"Upload Directory: {RAG_UPLOAD_DIR}")
-logger.info(f"Max Upload Size: {MAX_UPLOAD_SIZE_MB}MB")
-logger.info(f"Mem0 Integration: {'Enabled' if MEM0_API_KEY else 'Disabled'}")
-logger.info(f"DragonflyDB Caching: {'Enabled' if DRAGONFLY_URL else 'Disabled'}")
+            if HTTP_REQ in record.__dict__:
+                json_record[HTTP_REQ] = record.__dict__[HTTP_REQ]
 
-# Import vector store implementations
-try:
-    from app.vector_stores.pgvector_store import PGVectorStore
-    from app.vector_stores.atlas_mongo_store import AtlasMongoStore
-    logger.info("Vector store implementations imported successfully")
-except ImportError as e:
-    logger.warning(f"Could not import vector store implementations: {e}")
+            if HTTP_RES in record.__dict__:
+                json_record[HTTP_RES] = record.__dict__[HTTP_RES]
 
-def get_vector_store(connection_string: str, embeddings, collection_name: str, mode: str, **kwargs):
-    """Factory function to create vector store instances."""
-    if mode == "async":
-        # PGVector store for async operations
-        return PGVectorStore(
-            connection_string=connection_string,
-            embeddings=embeddings,
-            collection_name=collection_name,
+            if record.levelno == logging.ERROR and record.exc_info:
+                json_record["exception"] = self.formatException(record.exc_info)
+
+            timestamp = datetime.fromtimestamp(record.created)
+            json_record["timestamp"] = timestamp.isoformat()
+
+            # add level
+            json_record["level"] = record.levelname
+            json_record["filename"] = record.filename
+            json_record["lineno"] = record.lineno
+            json_record["funcName"] = record.funcName
+            json_record["module"] = record.module
+            json_record["threadName"] = record.threadName
+
+            return json.dumps(json_record)
+
+    formatter = JsonFormatter()
+else:
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+handler = logging.StreamHandler()  # or logging.FileHandler("app.log")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+
+class LogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+
+        logger_method = logger.info
+
+        if str(request.url).endswith("/health"):
+            logger_method = logger.debug
+
+        logger_method(
+            f"Request {request.method} {request.url} - {response.status_code}",
+            extra={
+                HTTP_REQ: {"method": request.method, "url": str(request.url)},
+                HTTP_RES: {"status_code": response.status_code},
+            },
         )
-    elif mode == "atlas-mongo":
-        # MongoDB Atlas Vector Search store
-        search_index = kwargs.get("search_index", collection_name)
-        return AtlasMongoStore(
-            connection_string=connection_string,
-            embeddings=embeddings,
-            collection_name=collection_name,
-            search_index=search_index,
-        )
-    else:
-        raise ValueError(f"Unsupported vector store mode: {mode}")
 
-# Initialize embeddings based on provider
-def init_embeddings(provider: str, model: str):
-    """Initialize embeddings based on the provider."""
-    if provider.lower() == "openai":
-        try:
-            from langchain_openai import OpenAIEmbeddings
-            return OpenAIEmbeddings(
-                model=model,
-                openai_api_key=OPENAI_API_KEY,
-            )
-        except ImportError:
-            raise ImportError("OpenAI embeddings not available. Install langchain-openai.")
-    elif provider.lower() == "huggingface":
-        try:
-            from langchain_huggingface import HuggingFaceEmbeddings
-            return HuggingFaceEmbeddings(model_name=model)
-        except ImportError:
-            raise ImportError("HuggingFace embeddings not available. Install langchain-huggingface.")
-    elif provider.lower() == "sentence_transformers":
-        try:
-            from langchain_community.embeddings import SentenceTransformerEmbeddings
-            return SentenceTransformerEmbeddings(model_name=model)
-        except ImportError:
-            raise ImportError("SentenceTransformers embeddings not available. Install sentence-transformers.")
+        return response
+
+
+logging.getLogger("uvicorn.access").disabled = True
+
+## Credentials
+
+OPENAI_API_KEY = get_env_variable("OPENAI_API_KEY", "")
+RAG_OPENAI_API_KEY = get_env_variable("RAG_OPENAI_API_KEY", OPENAI_API_KEY)
+RAG_OPENAI_BASEURL = get_env_variable("RAG_OPENAI_BASEURL", None)
+RAG_OPENAI_PROXY = get_env_variable("RAG_OPENAI_PROXY", None)
+AZURE_OPENAI_API_KEY = get_env_variable("AZURE_OPENAI_API_KEY", "")
+RAG_AZURE_OPENAI_API_VERSION = get_env_variable("RAG_AZURE_OPENAI_API_VERSION", None)
+RAG_AZURE_OPENAI_API_KEY = get_env_variable(
+    "RAG_AZURE_OPENAI_API_KEY", AZURE_OPENAI_API_KEY
+)
+AZURE_OPENAI_ENDPOINT = get_env_variable("AZURE_OPENAI_ENDPOINT", "")
+RAG_AZURE_OPENAI_ENDPOINT = get_env_variable(
+    "RAG_AZURE_OPENAI_ENDPOINT", AZURE_OPENAI_ENDPOINT
+).rstrip("/")
+HF_TOKEN = get_env_variable("HF_TOKEN", "")
+OLLAMA_BASE_URL = get_env_variable("OLLAMA_BASE_URL", "http://ollama:11434")
+AWS_ACCESS_KEY_ID = get_env_variable("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = get_env_variable("AWS_SECRET_ACCESS_KEY", "")
+AWS_SESSION_TOKEN = get_env_variable("AWS_SESSION_TOKEN", "")
+GOOGLE_APPLICATION_CREDENTIALS = get_env_variable("GOOGLE_APPLICATION_CREDENTIALS", "")
+env_value = get_env_variable("RAG_CHECK_EMBEDDING_CTX_LENGTH", "True").lower()
+RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
+
+## Embeddings
+
+
+def init_embeddings(provider, model):
+    if provider == EmbeddingsProvider.OPENAI:
+        from langchain_openai import OpenAIEmbeddings
+
+        return OpenAIEmbeddings(
+            model=model,
+            api_key=RAG_OPENAI_API_KEY,
+            openai_api_base=RAG_OPENAI_BASEURL,
+            openai_proxy=RAG_OPENAI_PROXY,
+            chunk_size=EMBEDDINGS_CHUNK_SIZE,
+            check_embedding_ctx_length=RAG_CHECK_EMBEDDING_CTX_LENGTH,
+        )
+    elif provider == EmbeddingsProvider.AZURE:
+        from langchain_openai import AzureOpenAIEmbeddings
+
+        return AzureOpenAIEmbeddings(
+            azure_deployment=model,
+            api_key=RAG_AZURE_OPENAI_API_KEY,
+            azure_endpoint=RAG_AZURE_OPENAI_ENDPOINT,
+            api_version=RAG_AZURE_OPENAI_API_VERSION,
+            chunk_size=EMBEDDINGS_CHUNK_SIZE,
+            check_embedding_ctx_length=RAG_CHECK_EMBEDDING_CTX_LENGTH,
+        )
+    elif provider == EmbeddingsProvider.HUGGINGFACE:
+        from langchain_huggingface import HuggingFaceEmbeddings
+
+        return HuggingFaceEmbeddings(
+            model_name=model, encode_kwargs={"normalize_embeddings": True}
+        )
+    elif provider == EmbeddingsProvider.HUGGINGFACETEI:
+        from langchain_huggingface import HuggingFaceEndpointEmbeddings
+
+        return HuggingFaceEndpointEmbeddings(model=model)
+    elif provider == EmbeddingsProvider.OLLAMA:
+        from langchain_ollama import OllamaEmbeddings
+
+        return OllamaEmbeddings(model=model, base_url=OLLAMA_BASE_URL)
+    elif provider == EmbeddingsProvider.GOOGLE_VERTEXAI:
+        from langchain_google_vertexai import VertexAIEmbeddings
+
+        return VertexAIEmbeddings(model=model)
+    elif provider == EmbeddingsProvider.BEDROCK:
+        from langchain_aws import BedrockEmbeddings
+
+        session_kwargs = {
+            "aws_access_key_id": AWS_ACCESS_KEY_ID,
+            "aws_secret_access_key": AWS_SECRET_ACCESS_KEY,
+            "region_name": AWS_DEFAULT_REGION,
+        }
+
+        if AWS_SESSION_TOKEN:
+            session_kwargs["aws_session_token"] = AWS_SESSION_TOKEN
+
+        session = boto3.Session(**session_kwargs)
+        return BedrockEmbeddings(
+            client=session.client("bedrock-runtime"),
+            model_id=model,
+            region_name=AWS_DEFAULT_REGION,
+        )
     else:
         raise ValueError(f"Unsupported embeddings provider: {provider}")
 
-try:
-    embeddings = init_embeddings(EMBEDDINGS_PROVIDER, EMBEDDINGS_MODEL)
-    logger.info(f"Initialized embeddings of type: {type(embeddings)}")
-except Exception as e:
-    logger.error(f"Failed to initialize embeddings: {e}")
+
+EMBEDDINGS_PROVIDER = EmbeddingsProvider(
+    get_env_variable("EMBEDDINGS_PROVIDER", EmbeddingsProvider.OPENAI.value).lower()
+)
+
+if EMBEDDINGS_PROVIDER == EmbeddingsProvider.OPENAI:
+    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "text-embedding-3-small")
+    # 1000 is the default chunk size for OpenAI, but this causes API rate limits to be hit
+    EMBEDDINGS_CHUNK_SIZE = get_env_variable("EMBEDDINGS_CHUNK_SIZE", 200)
+elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.AZURE:
+    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "text-embedding-3-small")
+    # 2048 is the default (and maximum) chunk size for Azure, but this often causes unexpected 429 errors
+    EMBEDDINGS_CHUNK_SIZE = get_env_variable("EMBEDDINGS_CHUNK_SIZE", 200)
+elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.HUGGINGFACE:
+    EMBEDDINGS_MODEL = get_env_variable(
+        "EMBEDDINGS_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+    )
+elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.HUGGINGFACETEI:
+    EMBEDDINGS_MODEL = get_env_variable(
+        "EMBEDDINGS_MODEL", "http://huggingfacetei:3000"
+    )
+elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.GOOGLE_VERTEXAI:
+    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "text-embedding-004")
+elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.OLLAMA:
+    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "nomic-embed-text")
+elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.BEDROCK:
+    EMBEDDINGS_MODEL = get_env_variable(
+        "EMBEDDINGS_MODEL", "amazon.titan-embed-text-v1"
+    )
+    AWS_DEFAULT_REGION = get_env_variable("AWS_DEFAULT_REGION", "us-east-1")
+else:
     raise ValueError(f"Unsupported embeddings provider: {EMBEDDINGS_PROVIDER}")
 
 embeddings = init_embeddings(EMBEDDINGS_PROVIDER, EMBEDDINGS_MODEL)
@@ -233,55 +341,49 @@ known_source_ext = [
     "sh",
     "bat",
     "ps1",
+    "cmd",
     "js",
     "ts",
-    "html",
     "css",
     "cpp",
     "hpp",
     "h",
     "c",
     "cs",
-    "php",
-    "rb",
-    "swift",
-    "kt",
-    "scala",
-    "clj",
-    "hs",
-    "elm",
-    "rs",
-    "dart",
-    "lua",
-    "pl",
-    "r",
-    "m",
     "sql",
-    "json",
-    "xml",
-    "yaml",
-    "yml",
-    "toml",
+    "log",
     "ini",
-    "cfg",
-    "conf",
-    "properties",
-    "env",
+    "pl",
+    "pm",
+    "r",
+    "dart",
     "dockerfile",
-    "makefile",
-    "cmake",
-    "gradle",
-    "maven",
-    "sbt",
-    "cabal",
-    "cargo",
-    "poetry",
-    "pipfile",
-    "requirements",
-    "gemfile",
-    "package",
-    "bower",
-    "composer",
+    "env",
+    "php",
+    "hs",
+    "hsc",
+    "lua",
+    "nginxconf",
+    "conf",
+    "m",
+    "mm",
+    "plsql",
+    "perl",
+    "rb",
+    "rs",
+    "db2",
+    "scala",
+    "bash",
+    "swift",
+    "vue",
+    "svelte",
+    "yml",
+    "yaml",
+    "eml",
+    "ex",
+    "exs",
+    "erl",
+    "tsx",
+    "jsx",
+    "lhs",
 ]
-
-logger.info("Configuration initialization completed")
