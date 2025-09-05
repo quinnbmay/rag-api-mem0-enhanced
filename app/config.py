@@ -293,33 +293,46 @@ embeddings = init_embeddings(EMBEDDINGS_PROVIDER, EMBEDDINGS_MODEL)
 
 logger.info(f"Initialized embeddings of type: {type(embeddings)}")
 
-# Vector store
-if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
-    vector_store = get_vector_store(
-        connection_string=CONNECTION_STRING,
-        embeddings=embeddings,
-        collection_name=COLLECTION_NAME,
-        mode="async",
-    )
-elif VECTOR_DB_TYPE == VectorDBType.ATLAS_MONGO:
-    # Backward compatability check
-    if MONGO_VECTOR_COLLECTION:
-        logger.info(
-            f"DEPRECATED: Please remove env var MONGO_VECTOR_COLLECTION and instead use COLLECTION_NAME and ATLAS_SEARCH_INDEX. You can set both as same, but not neccessary. See README for more information."
-        )
-        ATLAS_SEARCH_INDEX = MONGO_VECTOR_COLLECTION
-        COLLECTION_NAME = MONGO_VECTOR_COLLECTION
-    vector_store = get_vector_store(
-        connection_string=ATLAS_MONGO_DB_URI,
-        embeddings=embeddings,
-        collection_name=COLLECTION_NAME,
-        mode="atlas-mongo",
-        search_index=ATLAS_SEARCH_INDEX,
-    )
-else:
-    raise ValueError(f"Unsupported vector store type: {VECTOR_DB_TYPE}")
+# Vector store initialization
+vector_store = None
+retriever = None
 
-retriever = vector_store.as_retriever()
+def initialize_vector_store():
+    global vector_store, retriever
+    if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
+        vector_store = get_vector_store(
+            connection_string=CONNECTION_STRING,
+            embeddings=embeddings,
+            collection_name=COLLECTION_NAME,
+            mode="async",
+        )
+    elif VECTOR_DB_TYPE == VectorDBType.ATLAS_MONGO:
+        # Backward compatability check
+        if MONGO_VECTOR_COLLECTION:
+            logger.info(
+                f"DEPRECATED: Please remove env var MONGO_VECTOR_COLLECTION and instead use COLLECTION_NAME and ATLAS_SEARCH_INDEX. You can set both as same, but not neccessary. See README for more information."
+            )
+            ATLAS_SEARCH_INDEX = MONGO_VECTOR_COLLECTION
+            COLLECTION_NAME = MONGO_VECTOR_COLLECTION
+        vector_store = get_vector_store(
+            connection_string=ATLAS_MONGO_DB_URI,
+            embeddings=embeddings,
+            collection_name=COLLECTION_NAME,
+            mode="atlas-mongo",
+            search_index=ATLAS_SEARCH_INDEX,
+        )
+    else:
+        raise ValueError(f"Unsupported vector store type: {VECTOR_DB_TYPE}")
+    
+    retriever = vector_store.as_retriever()
+    return vector_store, retriever
+
+# Initialize immediately for imports
+try:
+    vector_store, retriever = initialize_vector_store()
+except Exception as e:
+    logger.warning(f"Failed to initialize vector store during import: {e}")
+    # Keep vector_store and retriever as None for now
 
 known_source_ext = [
     "go",
