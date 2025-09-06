@@ -36,5 +36,6 @@ python-magic
 python-pptx
 xlrd
 pydantic
+pydantic-settings
 redis
 requests
